@@ -44,6 +44,6 @@ class OpenAPI(BaseModel):
             raise ValueError(f"Invalid OpenAPI version {value}")
         if parts[0] != "3":
             raise ValueError(f"Only OpenAPI versions 3.* are supported, got {value}")
-        if int(parts[1]) > 1:
-            raise ValueError(f"Only OpenAPI versions 3.1.* are supported, got {value}")
+        if int(parts[1]) > 2:
+            raise ValueError(f"Only OpenAPI versions 3.0.*, 3.1.* and 3.2.* are supported, got {value}")
         return untrusted

@@ -13,7 +13,9 @@ from openapi_python_client.schema.untrusted_string import UntrustedString
         ("2.0", False),
         ("3.0.0", True),
         ("3.1.1", True),
-        ("3.2.0", False),
+        ("3.2.0", True),
+        ("3.2.1", True),
+        ("3.3.0", False),
         ("4.0.0", False),
     ],
 )

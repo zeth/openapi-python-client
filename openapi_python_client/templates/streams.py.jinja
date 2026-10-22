@@ -115,6 +115,9 @@ class _EventParser:
         self.last_event_id: str | None = None
         self.retry: int | None = None
         self._first = True
+        # An id takes effect only when its event is dispatched, so an event cut off by a dropped
+        # connection never moves the stream past itself.
+        self._id_buffer: str | None = None
         self._event = ""
         self._data: list[str] = []
         self._event_retry: int | None = None
@@ -136,12 +139,13 @@ class _EventParser:
         elif field == "data":
             self._data.append(value)
         elif field == "id" and "\0" not in value:
-            self.last_event_id = value
+            self._id_buffer = value or None
         elif field == "retry" and value and all("0" <= character <= "9" for character in value):
             self.retry = self._event_retry = int(value)
         return None
 
     def _dispatch(self) -> ServerSentEvent[str] | None:
+        self.last_event_id = self._id_buffer
         event = None
         if self._data:
             event = ServerSentEvent(

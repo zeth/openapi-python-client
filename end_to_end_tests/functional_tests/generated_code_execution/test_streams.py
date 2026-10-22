@@ -142,6 +142,25 @@ class TestEventStreams:
         assert "last-event-id" not in requests[0].headers
         assert requests[1].headers["last-event-id"] == "7"
 
+    def test_an_event_cut_off_by_a_dropped_connection_is_not_skipped(self, Client, Ready, watch):
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            if len(requests) == 1:
+                # The last event never ends, so its id must not count as received.
+                return _events('retry: 0\nid: 1\nevent: ready\ndata: {"cursor": "a"}\n\nid: 2\ndata: cut')
+            if len(requests) == 2:
+                # An id with no data still moves the stream on.
+                return _events("id: 3\n\n")
+            return httpx.Response(204)
+
+        with watch(client=_client(Client, handler)) as events:
+            assert [event.data for event in events] == [Ready(cursor="a")]
+            assert events.last_event_id == "3"
+        assert requests[1].headers["last-event-id"] == "1"
+        assert requests[2].headers["last-event-id"] == "3"
+
     def test_reconnects_after_a_dropped_connection(self, Client, Ready, watch):
         attempts = []
 

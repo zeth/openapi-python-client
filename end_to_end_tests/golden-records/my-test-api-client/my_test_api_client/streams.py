@@ -201,7 +201,12 @@ class _EventParser:
 
 def _check_status(response: httpx.Response, parse_error: Callable[[httpx.Response], Any]) -> None:
     if not 200 <= response.status_code <= 299:
-        raise StreamError(response.status_code, response.content, parse_error(response))
+        # A body that doesn't match its declared schema must not hide the status.
+        try:
+            parsed = parse_error(response)
+        except Exception:
+            parsed = None
+        raise StreamError(response.status_code, response.content, parsed)
 
 
 class EventStream(Generic[T]):

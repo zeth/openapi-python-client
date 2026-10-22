@@ -106,6 +106,7 @@ def _events(body: str, status: int = 200) -> httpx.Response:
 @with_generated_code_import(".api.default.watch.stream", alias="watch")
 @with_generated_code_import(".api.default.watch.astream", alias="awatch")
 @with_generated_code_import(".api.default.run.stream", alias="run")
+@with_generated_code_import(".api.default.download.stream", alias="download")
 class TestEventStreams:
     def test_decodes_declared_events_and_passes_others_through(self, Client, Ready, watch):
         body = (
@@ -196,6 +197,16 @@ class TestEventStreams:
                 pass
         assert raised.value.status_code == 404
         assert raised.value.parsed == Problem(message="gone")
+
+    def test_an_error_body_that_does_not_match_its_schema_still_raises_the_status(
+        self, Client, StreamError, watch, download
+    ):
+        client = _client(Client, lambda request: httpx.Response(404, json={"unexpected": True}))
+        for stream in (watch(client=client), download("f", client=client)):
+            with pytest.raises(StreamError) as raised:
+                with stream:
+                    pass
+            assert (raised.value.status_code, raised.value.parsed) == (404, None)
 
     def test_finished_before_it_starts(self, Client, watch):
         with watch(client=_client(Client, lambda request: httpx.Response(204))) as events:

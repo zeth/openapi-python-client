@@ -94,9 +94,8 @@ def _stream_timeout(client: httpx.Client | httpx.AsyncClient, timeout: httpx.Tim
     return httpx.Timeout(connect=default.connect, read=None, write=default.write, pool=default.pool)
 
 
-async def _aclose(response: httpx.Response) -> None:
-    """Close a response, finishing the cleanup even if the calling task is cancelled again meanwhile"""
-    cleanup = asyncio.ensure_future(response.aclose())
+async def _finish(cleanup: asyncio.Future[None]) -> None:
+    """Wait for cleanup to finish even if the calling task is cancelled meanwhile, then pass the cancellation on"""
     cancelled = False
     while not cleanup.done():
         try:
@@ -106,6 +105,35 @@ async def _aclose(response: httpx.Response) -> None:
     cleanup.result()
     if cancelled:
         raise asyncio.CancelledError
+
+
+class _ShieldedStream(httpx.AsyncByteStream):
+    """A response body whose closing finishes even when cancelled, including httpx's own close at its end"""
+
+    def __init__(self, stream: httpx.AsyncByteStream) -> None:
+        self._stream = stream
+        self._cleanup: asyncio.Future[None] | None = None
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        async for chunk in self._stream:
+            yield chunk
+
+    async def aclose(self) -> None:
+        if self._cleanup is None:
+            self._cleanup = asyncio.ensure_future(self._stream.aclose())
+        await _finish(self._cleanup)
+
+
+async def _asend(client: httpx.AsyncClient, request: httpx.Request) -> httpx.Response:
+    response = await client.send(request, stream=True)
+    if isinstance(response.stream, httpx.AsyncByteStream):
+        response.stream = _ShieldedStream(response.stream)
+    return response
+
+
+async def _aclose(response: httpx.Response) -> None:
+    """Close a response, finishing the cleanup even if the calling task is cancelled again meanwhile"""
+    await _finish(asyncio.ensure_future(response.aclose()))
 
 
 class _EventParser:
@@ -320,7 +348,7 @@ class AsyncEventStream(Generic[T]):
 
     async def _open(self, request: dict[str, Any]) -> None:
         request = {**request, "timeout": _stream_timeout(self._client, self.timeout)}
-        response = await self._client.send(self._client.build_request(**request), stream=True)
+        response = await _asend(self._client, self._client.build_request(**request))
         if response.status_code == 204:
             await _aclose(response)
             self._finished = True
@@ -462,7 +490,7 @@ class AsyncByteStream:
         return self._response
 
     async def __aenter__(self) -> Self:
-        response = await self._client.send(self._client.build_request(**self._request), stream=True)
+        response = await _asend(self._client, self._client.build_request(**self._request))
         if not 200 <= response.status_code <= 299:
             try:
                 await response.aread()

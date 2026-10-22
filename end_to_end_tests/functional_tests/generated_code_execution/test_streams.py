@@ -247,6 +247,40 @@ class TestEventStreams:
             assert [event.data for event in events] == ["a", "b"]
         assert slept == [0.5, 0.25]
 
+    def test_cancelled_cleanup_still_finishes(self, Client, awatch):
+        # httpx closes a response itself at its end; a second cancellation must not interrupt that.
+        closing, finish = asyncio.Event(), asyncio.Event()
+
+        class SlowClose(httpx.AsyncByteStream):
+            closed = False
+
+            async def __aiter__(self):
+                yield b""
+
+            async def aclose(self):
+                closing.set()
+                await finish.wait()
+                self.closed = True
+
+        body = SlowClose()
+
+        async def read():
+            response = httpx.Response(200, stream=body, headers={"content-type": "text/event-stream"})
+            async with awatch(client=_client(Client, lambda request: response), reconnect=False) as events:
+                pending = asyncio.create_task(anext(events, None))
+                await asyncio.wait_for(closing.wait(), 2)
+                pending.cancel()
+                await asyncio.sleep(0)
+                pending.cancel()
+                await asyncio.sleep(0)
+                assert not body.closed and not pending.done()
+                finish.set()
+                with pytest.raises(asyncio.CancelledError):
+                    await pending
+                assert body.closed
+
+        asyncio.run(read())
+
     def test_asyncio(self, Client, Ready, awatch):
         requests = []
 

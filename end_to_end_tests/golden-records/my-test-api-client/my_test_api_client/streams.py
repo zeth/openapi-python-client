@@ -30,14 +30,82 @@ class ServerSentEvent(Generic[T]):
 
 
 class StreamError(Exception):
-    """Raised when a stream's request is answered with an error status instead of the stream"""
+    """Raised when a stream's request is answered with an error status, or with something other than the stream"""
 
-    def __init__(self, status_code: int, content: bytes, parsed: Any) -> None:
+    def __init__(self, status_code: int, content: bytes, parsed: Any, message: str | None = None) -> None:
         self.status_code = status_code
         self.content = content
         self.parsed = parsed
         """ The response body, parsed as the API describes it for this status, or None """
-        super().__init__(f"Unexpected status code: {status_code}")
+        super().__init__(message or f"Unexpected status code: {status_code}")
+
+
+def _split_lines(text: str, line: list[str], after_cr: bool) -> tuple[list[str], bool]:
+    """Split text into lines at CR, LF or CRLF only, as the event-stream format does, carrying a partial line"""
+    lines = []
+    for character in text:
+        if after_cr and character == "\n":
+            after_cr = False
+            continue
+        after_cr = character == "\r"
+        if character in "\r\n":
+            lines.append("".join(line))
+            line.clear()
+        else:
+            line.append(character)
+    return lines, after_cr
+
+
+def _lines(response: httpx.Response) -> Iterator[str]:
+    # An event stream is always UTF-8, and only CR and LF end its lines: not the Unicode line separators
+    # that str.splitlines (and so httpx's iter_lines) also splits at, which can appear in JSON strings.
+    response.encoding = "utf-8"
+    line: list[str] = []
+    after_cr = False
+    for text in response.iter_text():
+        lines, after_cr = _split_lines(text, line, after_cr)
+        yield from lines
+    # A partial line at the end is not a line: its event is incomplete.
+
+
+async def _alines(response: httpx.Response) -> AsyncIterator[str]:
+    response.encoding = "utf-8"
+    line: list[str] = []
+    after_cr = False
+    async for text in response.aiter_text():
+        lines, after_cr = _split_lines(text, line, after_cr)
+        for complete in lines:
+            yield complete
+
+
+def _check_event_stream(response: httpx.Response) -> str | None:
+    """Why a successful response is not an event stream, or None if it is one"""
+    content_type = response.headers.get("content-type", "").split(";")[0].strip().lower()
+    if content_type != "text/event-stream":
+        return f"Expected a text/event-stream response, got {content_type or 'no content type'}"
+    return None
+
+
+def _stream_timeout(client: httpx.Client | httpx.AsyncClient, timeout: httpx.Timeout | None) -> httpx.Timeout:
+    """The timeout for an event stream: the client's, without a read timeout, since events can be far apart"""
+    if timeout is not None:
+        return timeout
+    default = client.timeout
+    return httpx.Timeout(connect=default.connect, read=None, write=default.write, pool=default.pool)
+
+
+async def _aclose(response: httpx.Response) -> None:
+    """Close a response, finishing the cleanup even if the calling task is cancelled again meanwhile"""
+    cleanup = asyncio.ensure_future(response.aclose())
+    cancelled = False
+    while not cleanup.done():
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            cancelled = True
+    cleanup.result()
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 class _EventParser:
@@ -46,12 +114,16 @@ class _EventParser:
     def __init__(self) -> None:
         self.last_event_id: str | None = None
         self.retry: int | None = None
+        self._first = True
         self._event = ""
         self._data: list[str] = []
         self._event_retry: int | None = None
 
     def feed(self, line: str) -> ServerSentEvent[str] | None:
         """Read one line; return the event it completes, if any"""
+        if self._first:
+            line = line.removeprefix("\ufeff")
+            self._first = False
         if line == "":
             return self._dispatch()
         if line.startswith(":"):
@@ -91,8 +163,8 @@ class _EventParser:
         headers["Last-Event-ID"] = self.last_event_id
         return {**request, "headers": headers}
 
-    def reconnect_delay(self) -> float:
-        return DEFAULT_RETRY_SECONDS if self.retry is None else self.retry / 1000
+    def reconnect_delay(self, default: float) -> float:
+        return default if self.retry is None else self.retry / 1000
 
 
 def _check_status(response: httpx.Response, parse_error: Callable[[httpx.Response], Any]) -> None:
@@ -107,6 +179,10 @@ class EventStream(Generic[T]):
     on, which is the default for GET requests, a closed or broken connection is reopened after the server's `retry`
     delay, resuming with `Last-Event-ID`, and the stream ends when the server answers a reconnection with 204 No
     Content. Without it, the stream ends when the connection closes.
+
+    Set `reconnect_delay` (seconds) for the wait until the server sends its own `retry`, and `timeout` to replace
+    the default, which is the client's timeout without a read timeout. A successful response that isn't
+    `text/event-stream` raises `StreamError`.
     """
 
     def __init__(
@@ -128,6 +204,8 @@ class EventStream(Generic[T]):
         self._lines: Iterator[str] | None = None
         self._entered = False
         self._finished = False
+        self.reconnect_delay = DEFAULT_RETRY_SECONDS
+        self.timeout: httpx.Timeout | None = None
 
     @property
     def last_event_id(self) -> str | None:
@@ -135,6 +213,7 @@ class EventStream(Generic[T]):
         return self._parser.last_event_id
 
     def _open(self, request: dict[str, Any]) -> None:
+        request = {**request, "timeout": _stream_timeout(self._client, self.timeout)}
         response = self._client.send(self._client.build_request(**request), stream=True)
         if response.status_code == 204:
             response.close()
@@ -146,8 +225,12 @@ class EventStream(Generic[T]):
                 _check_status(response, self._parse_error)
             finally:
                 response.close()
+        problem = _check_event_stream(response)
+        if problem is not None:
+            response.close()
+            raise StreamError(response.status_code, b"", None, problem)
         self._response = response
-        self._lines = response.iter_lines()
+        self._lines = _lines(response)
 
     def _close_response(self) -> None:
         if self._response is not None:
@@ -182,7 +265,7 @@ class EventStream(Generic[T]):
         while not self._finished:
             if self._lines is None:
                 # Reconnecting: an unreachable server is retried after the delay, as EventSource does.
-                time.sleep(self._parser.reconnect_delay())
+                time.sleep(self._parser.reconnect_delay(self.reconnect_delay))
                 try:
                     self._open(self._parser.reconnect_headers(self._request))
                 except httpx.TransportError:
@@ -223,6 +306,8 @@ class AsyncEventStream(Generic[T]):
         self._lines: AsyncIterator[str] | None = None
         self._entered = False
         self._finished = False
+        self.reconnect_delay = DEFAULT_RETRY_SECONDS
+        self.timeout: httpx.Timeout | None = None
 
     @property
     def last_event_id(self) -> str | None:
@@ -230,9 +315,10 @@ class AsyncEventStream(Generic[T]):
         return self._parser.last_event_id
 
     async def _open(self, request: dict[str, Any]) -> None:
+        request = {**request, "timeout": _stream_timeout(self._client, self.timeout)}
         response = await self._client.send(self._client.build_request(**request), stream=True)
         if response.status_code == 204:
-            await response.aclose()
+            await _aclose(response)
             self._finished = True
             return
         if not 200 <= response.status_code <= 299:
@@ -240,15 +326,18 @@ class AsyncEventStream(Generic[T]):
                 await response.aread()
                 _check_status(response, self._parse_error)
             finally:
-                await response.aclose()
+                await _aclose(response)
+        problem = _check_event_stream(response)
+        if problem is not None:
+            await _aclose(response)
+            raise StreamError(response.status_code, b"", None, problem)
         self._response = response
-        self._lines = response.aiter_lines()
+        self._lines = _alines(response)
 
     async def _close_response(self) -> None:
-        if self._response is not None:
-            await self._response.aclose()
-        self._response = None
-        self._lines = None
+        response, self._response, self._lines = self._response, None, None
+        if response is not None:
+            await _aclose(response)
 
     async def __aenter__(self) -> Self:
         self._entered = True
@@ -277,7 +366,7 @@ class AsyncEventStream(Generic[T]):
         while not self._finished:
             if self._lines is None:
                 # Reconnecting: an unreachable server is retried after the delay, as EventSource does.
-                await asyncio.sleep(self._parser.reconnect_delay())
+                await asyncio.sleep(self._parser.reconnect_delay(self.reconnect_delay))
                 try:
                     await self._open(self._parser.reconnect_headers(self._request))
                 except httpx.TransportError:
@@ -375,7 +464,7 @@ class AsyncByteStream:
                 await response.aread()
                 _check_status(response, self._parse_error)
             finally:
-                await response.aclose()
+                await _aclose(response)
         self._response = response
         return self
 
@@ -386,7 +475,7 @@ class AsyncByteStream:
         traceback: TracebackType | None,
     ) -> None:
         if self._response is not None:
-            await self._response.aclose()
+            await _aclose(self._response)
 
     def aiter_bytes(self, chunk_size: int | None = None) -> AsyncIterator[bytes]:
         """The body in chunks, as they arrive"""

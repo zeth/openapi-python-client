@@ -1,6 +1,7 @@
 import asyncio
 import io
 import json
+import time
 
 import httpx
 import pytest
@@ -184,6 +185,48 @@ class TestEventStreams:
     def test_iterating_outside_a_with_statement_is_refused(self, Client, watch):
         with pytest.raises(RuntimeError):
             next(iter(watch(client=_client(Client, lambda request: _events("")))))
+
+    def test_lines_end_only_at_cr_and_lf(self, Client, Ready, watch):
+        # A leading byte order mark is dropped, and U+2028 inside JSON does not end a line.
+        body = '\ufeffevent: ready\r\ndata: {"cursor": "a\u2028b"}\r\rdata: next\r\n\n'
+        with watch(client=_client(Client, lambda request: _events(body)), reconnect=False) as events:
+            received = list(events)
+        assert [event.data for event in received] == [Ready(cursor="a\u2028b"), "next"]
+
+    def test_a_response_that_is_not_an_event_stream_is_refused(self, Client, StreamError, watch):
+        client = _client(Client, lambda request: httpx.Response(200, json={"not": "events"}))
+        with pytest.raises(StreamError, match="Expected a text/event-stream response"):
+            with watch(client=client):
+                pass
+
+    def test_reading_has_no_timeout_unless_one_is_set(self, Client, watch):
+        timeouts = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            timeouts.append(request.extensions["timeout"])
+            return _events("data: x\n\n")
+
+        client = Client(
+            base_url="http://test", timeout=httpx.Timeout(5.0), httpx_args={"transport": httpx.MockTransport(handler)}
+        )
+        with watch(client=client, reconnect=False) as events:
+            list(events)
+        stream = watch(client=client, reconnect=False)
+        stream.timeout = httpx.Timeout(1.0)
+        with stream as events:
+            list(events)
+        assert (timeouts[0]["connect"], timeouts[0]["read"]) == (5.0, None)
+        assert timeouts[1]["read"] == 1.0
+
+    def test_reconnect_delay_applies_until_the_server_sets_one(self, Client, watch, monkeypatch):
+        slept = []
+        monkeypatch.setattr(time, "sleep", slept.append)
+        responses = iter([_events("data: a\n\n"), _events("retry: 250\ndata: b\n\n"), httpx.Response(204)])
+        stream = watch(client=_client(Client, lambda request: next(responses)))
+        stream.reconnect_delay = 0.5
+        with stream as events:
+            assert [event.data for event in events] == ["a", "b"]
+        assert slept == [0.5, 0.25]
 
     def test_asyncio(self, Client, Ready, awatch):
         requests = []

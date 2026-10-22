@@ -26,7 +26,7 @@ from .properties import (
     property_from_data,
 )
 from .properties.schemas import parameter_from_reference
-from .responses import HTTPStatusPattern, Responses, response_from_data
+from .responses import HTTPStatusPattern, Response, Responses, response_from_data
 
 _PATH_PARAM_REGEX = re.compile("{([a-zA-Z_-][a-zA-Z0-9_-]*)}")
 
@@ -196,6 +196,10 @@ class Endpoint:
             # No reasons to use lazy imports in endpoints, so add lazy imports to relative here.
             endpoint.relative_imports |= response.prop.get_lazy_imports(prefix=models_relative_prefix)
             endpoint.relative_imports |= response.prop.get_imports(prefix=models_relative_prefix)
+            for event in response.events or []:
+                if event.prop is not None:
+                    endpoint.relative_imports |= event.prop.get_lazy_imports(prefix=models_relative_prefix)
+                    endpoint.relative_imports |= event.prop.get_imports(prefix=models_relative_prefix)
             if response.is_default():
                 endpoint.responses.default = response
             else:
@@ -485,6 +489,30 @@ class Endpoint:
         if len(types) == 1:
             return strings.PythonCode(types[0])
         return strings.PythonCode(" | ".join(types))
+
+    def _success_responses(self) -> Iterator[Response]:
+        for response in self.responses:
+            if response.status_code.range is not None and 200 <= response.status_code.range[0] <= 299:
+                yield response
+
+    def event_stream_response(self) -> Response | None:
+        """The successful `text/event-stream` response described by `itemSchema`, if there is one"""
+        return next((response for response in self._success_responses() if response.events is not None), None)
+
+    def byte_stream_response(self) -> Response | None:
+        """The successful `application/octet-stream` response, if there is one"""
+        return next((response for response in self._success_responses() if response.byte_stream), None)
+
+    def event_data_type(self) -> strings.PythonCode:
+        """The Python type of an event's data in this endpoint's event stream
+
+        Events with JSON data decode to their declared type. Other events, including any the document doesn't name,
+        keep their data as a string.
+        """
+        response = self.event_stream_response()
+        events = response.events if response is not None and response.events is not None else []
+        types = {event.prop.get_type_string().as_unembedded_code() for event in events if event.prop is not None}
+        return strings.PythonCode(" | ".join([*sorted(types), "str"]))
 
     def iter_all_parameters(self) -> Iterator[tuple[oai.ParameterLocation, Property]]:
         """Iterate through all the parameters of this endpoint"""

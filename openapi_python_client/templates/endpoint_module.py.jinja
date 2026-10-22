@@ -8,12 +8,22 @@ from ...client import AuthenticatedClient, Client
 from ...types import Response, UNSET
 from ... import errors
 
+{% set event_response = endpoint.event_stream_response() %}
+{% set byte_response = none if event_response else endpoint.byte_stream_response() %}
+{% if event_response and event_response.events | selectattr("prop") | list %}
+import json
+{% endif %}
+{% if event_response %}
+from ...streams import AsyncEventStream, EventStream, ServerSentEvent
+{% elif byte_response %}
+from ...streams import AsyncByteStream, ByteStream
+{% endif %}
 {% for relative in endpoint.relative_imports | sort %}
 {{ relative }}
 {% endfor %}
 
 {% from "endpoint_macros.py.jinja" import header_params, cookie_params, query_params,
-    arguments, client, kwargs, parse_response, docstring, body_to_kwarg %}
+    arguments, client, kwargs, parse_response, docstring, body_to_kwarg, stream_docstring, decode_event %}
 
 {% set return_string = endpoint.response_type() %}
 {% set parsed_responses = (endpoint.responses | length > 0) and return_string != PythonCode("Any") %}
@@ -157,4 +167,83 @@ async def asyncio(
     return (await asyncio_detailed(
         {{ kwargs(endpoint) }}
     )).parsed
+{% endif %}
+{% if event_response %}
+{% set event_type = endpoint.event_data_type() | as_unembedded_code %}
+{% set fallback = event_response.events | selectattr("name", "none") | first %}
+
+
+def _decode_event(event: ServerSentEvent[str]) -> ServerSentEvent[{{ event_type }}]:
+    {% for kind in event_response.events if kind.name is not none %}
+    if event.event == "{{ kind.name | in_double_quote_literal }}":
+        {{ decode_event(kind) | indent(8) }}
+    {% endfor %}
+    {{ decode_event(fallback) | indent(4) }}
+
+
+def stream(
+    {{ arguments(endpoint) | indent(4) }}
+{% if endpoint.method == "get" %}
+    reconnect: bool = True,
+{% endif %}
+) -> EventStream[{{ event_type }}]:
+    {{ stream_docstring(endpoint, "EventStream[" + event_type + "]") | indent(4) }}
+
+    return EventStream(
+        client.get_httpx_client(),
+        _get_kwargs(
+            {{ kwargs(endpoint, include_client=False) | indent(12) }}
+        ),
+        _decode_event,
+        lambda response: _parse_response(client=client, response=response),
+        reconnect={{ "reconnect" if endpoint.method == "get" else "False" }},
+    )
+
+
+def astream(
+    {{ arguments(endpoint) | indent(4) }}
+{% if endpoint.method == "get" %}
+    reconnect: bool = True,
+{% endif %}
+) -> AsyncEventStream[{{ event_type }}]:
+    {{ stream_docstring(endpoint, "AsyncEventStream[" + event_type + "]") | indent(4) }}
+
+    return AsyncEventStream(
+        client.get_async_httpx_client(),
+        _get_kwargs(
+            {{ kwargs(endpoint, include_client=False) | indent(12) }}
+        ),
+        _decode_event,
+        lambda response: _parse_response(client=client, response=response),
+        reconnect={{ "reconnect" if endpoint.method == "get" else "False" }},
+    )
+{% elif byte_response %}
+
+
+def stream(
+    {{ arguments(endpoint) | indent(4) }}
+) -> ByteStream:
+    {{ stream_docstring(endpoint, "ByteStream") | indent(4) }}
+
+    return ByteStream(
+        client.get_httpx_client(),
+        _get_kwargs(
+            {{ kwargs(endpoint, include_client=False) | indent(12) }}
+        ),
+        lambda response: _parse_response(client=client, response=response),
+    )
+
+
+def astream(
+    {{ arguments(endpoint) | indent(4) }}
+) -> AsyncByteStream:
+    {{ stream_docstring(endpoint, "AsyncByteStream") | indent(4) }}
+
+    return AsyncByteStream(
+        client.get_async_httpx_client(),
+        _get_kwargs(
+            {{ kwargs(endpoint, include_client=False) | indent(12) }}
+        ),
+        lambda response: _parse_response(client=client, response=response),
+    )
 {% endif %}

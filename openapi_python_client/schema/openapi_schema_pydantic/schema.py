@@ -49,6 +49,8 @@ class Schema(BaseModel):
     additionalProperties: bool | ReferenceOr["Schema"] | None = None
     description: UntrustedString | None = None
     schema_format: UntrustedString | None = Field(default=None, alias="format")
+    contentMediaType: UntrustedString | None = None
+    contentSchema: ReferenceOr["Schema"] | None = None
     default: Any | None = None
     nullable: bool = Field(default=False)
     discriminator: Discriminator | None = None

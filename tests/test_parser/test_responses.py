@@ -182,7 +182,94 @@ def test_response_from_data_content_type_overrides(any_property_factory):
         ),
         source=NONE_SOURCE,
         data=data,
+        byte_stream=True,
     )
+
+
+def _event_stream_response(item_schema: oai.Schema | oai.Reference) -> oai.Response:
+    return oai.Response.model_construct(
+        description="",
+        content={UntrustedString("text/event-stream"): oai.MediaType.model_construct(item_schema=item_schema)},
+    )
+
+
+def _event_stream(item_schema: oai.Schema | oai.Reference, config):
+    return response_from_data(
+        status_code=HTTPStatusPattern(pattern="200", code_range=(200, 200)),
+        data=_event_stream_response(item_schema),
+        schemas=Schemas(),
+        responses={},
+        parent_name="parent",
+        config=config,
+    )
+
+
+def _event(name: str | None, data: oai.Schema) -> oai.Schema:
+    properties: dict[str, oai.Schema] = {"data": data}
+    if name is not None:
+        properties["event"] = oai.Schema(const=name)
+    return oai.Schema(type=oai.DataType.OBJECT, properties=properties)
+
+
+def test_response_from_data_event_stream(config):
+    json_data = oai.Schema(
+        type=oai.DataType.STRING,
+        contentMediaType="application/json",
+        contentSchema=oai.Schema(type=oai.DataType.INTEGER),
+    )
+    text_data = oai.Schema(type=oai.DataType.STRING)
+    response, _schemas = _event_stream(oai.Schema(oneOf=[_event("count", json_data), _event(None, text_data)]), config)
+
+    assert isinstance(response, Response)
+    assert response.source == NONE_SOURCE
+    assert response.events is not None
+    assert [event.name for event in response.events] == [UntrustedString("count"), None]
+    assert response.events[0].prop is not None
+    assert response.events[0].prop.get_type_string().as_unembedded_code() == "int"
+    assert response.events[1].prop is None
+
+
+@pytest.mark.parametrize("content_media_type", ["text/csv", None])
+def test_response_from_data_event_stream_ignores_data_that_is_not_json(config, content_media_type):
+    data = oai.Schema(
+        type=oai.DataType.STRING,
+        contentMediaType=content_media_type,
+        contentSchema=oai.Schema(type=oai.DataType.INTEGER),
+    )
+    response, _schemas = _event_stream(_event("row", data), config)
+
+    assert isinstance(response, Response)
+    assert response.events == [responses.StreamEvent(name=UntrustedString("row"), prop=None)]
+
+
+@pytest.mark.parametrize(
+    "item_schema, detail",
+    [
+        (oai.Reference(ref="#/components/schemas/Event"), "A $ref itemSchema for an event stream is not supported"),
+        (
+            oai.Schema(oneOf=[oai.Reference(ref="#/components/schemas/Event")]),
+            "A $ref event in an event stream is not supported",
+        ),
+    ],
+)
+def test_response_from_data_event_stream_references(config, item_schema, detail):
+    response, _schemas = _event_stream(item_schema, config)
+
+    assert isinstance(response, ParseError)
+    assert response.detail == detail
+
+
+def test_response_from_data_event_stream_property_error(config, mocker):
+    mocker.patch.object(responses, "property_from_data", return_value=(PropertyError(detail="bad"), Schemas()))
+    data = oai.Schema(
+        type=oai.DataType.STRING,
+        contentMediaType="application/json",
+        contentSchema=oai.Schema(type=oai.DataType.INTEGER),
+    )
+    response, _schemas = _event_stream(_event("count", data), config)
+
+    assert isinstance(response, ParseError)
+    assert response.detail == "bad"
 
 
 @pytest.mark.parametrize(

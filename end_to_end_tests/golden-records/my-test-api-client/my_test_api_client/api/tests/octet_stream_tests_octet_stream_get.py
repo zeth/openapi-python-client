@@ -6,6 +6,7 @@ import httpx
 
 from ... import errors
 from ...client import AuthenticatedClient, Client
+from ...streams import AsyncByteStream, ByteStream
 from ...types import File, Response
 
 
@@ -122,3 +123,45 @@ async def asyncio(
             client=client,
         )
     ).parsed
+
+
+def stream(
+    *,
+    client: AuthenticatedClient | Client,
+) -> ByteStream:
+    """Octet Stream
+
+    Raises:
+        StreamError: If the server answers with an error status instead of the stream.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        ByteStream
+    """
+
+    return ByteStream(
+        client.get_httpx_client(),
+        _get_kwargs(),
+        lambda response: _parse_response(client=client, response=response),
+    )
+
+
+def astream(
+    *,
+    client: AuthenticatedClient | Client,
+) -> AsyncByteStream:
+    """Octet Stream
+
+    Raises:
+        StreamError: If the server answers with an error status instead of the stream.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        AsyncByteStream
+    """
+
+    return AsyncByteStream(
+        client.get_async_httpx_client(),
+        _get_kwargs(),
+        lambda response: _parse_response(client=client, response=response),
+    )

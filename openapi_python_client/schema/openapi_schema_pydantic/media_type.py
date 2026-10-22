@@ -18,6 +18,7 @@ class MediaType(BaseModel):
     """
 
     media_type_schema: ReferenceOr[Schema] | None = Field(default=None, alias="schema")
+    item_schema: ReferenceOr[Schema] | None = Field(default=None, alias="itemSchema")
     example: Any | None = None
     examples: dict[UntrustedString, ReferenceOr[Example]] | None = None
     encoding: dict[UntrustedString, Encoding] | None = None

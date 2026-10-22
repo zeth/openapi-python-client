@@ -265,6 +265,18 @@ class Project:
         errors_template = self.env.get_template("errors.py.jinja")
         errors_path.write_text(errors_template.render(), encoding=self.config.file_encoding)
 
+        # Generate the streaming runtime, when an endpoint streams its response
+        streams_path = self.package_dir / "streams.py"
+        if any(
+            endpoint.event_stream_response() or endpoint.byte_stream_response()
+            for collection in self.openapi.endpoint_collections_by_tag.values()
+            for endpoint in collection.endpoints
+        ):
+            streams_template = self.env.get_template("streams.py.jinja")
+            streams_path.write_text(streams_template.render(), encoding=self.config.file_encoding)
+        else:
+            streams_path.unlink(missing_ok=True)
+
         # Generate endpoints
         api_dir = self.package_dir / "api"
         shutil.rmtree(api_dir, ignore_errors=True)
